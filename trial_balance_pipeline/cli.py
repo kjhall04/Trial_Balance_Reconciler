@@ -12,7 +12,12 @@ from .workflow import build_from_workbooks
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--current-workbook", action="append", default=[], help="Current-year raw client workbook. Repeat for multi-entity jobs.")
-    parser.add_argument("--prior-workbook", action="append", default=[], help="Prior-year trial-balance workbook. Repeat when the job has multiple entities.")
+    parser.add_argument(
+        "--prior-workbook",
+        action="append",
+        default=[],
+        help="Optional prior-year official trial-balance workbook. Repeat when the job has multiple entities.",
+    )
     parser.add_argument("--client-config", type=str, default="", help="Optional JSON setup file with workbook parser and entity rules.")
     parser.add_argument("--entity-override", action="append", default=[], help="Optional KEY=Entity Name override.")
     parser.add_argument("--out-import", type=str, default="tb_to_import_updated.xlsx")
@@ -28,8 +33,6 @@ def main() -> None:
     args = parse_args()
     if not args.current_workbook:
         raise SystemExit("At least one --current-workbook path is required.")
-    if not args.prior_workbook:
-        raise SystemExit("At least one --prior-workbook path is required.")
 
     client_config = load_client_config(args.client_config) if str(args.client_config).strip() else None
     entity_overrides = parse_entity_overrides("\n".join(args.entity_override))
@@ -56,4 +59,5 @@ def main() -> None:
     print(result.summary.to_string(index=False))
     if not result.ready_for_import:
         print("\nManual review is still required. See the review_queue sheet in the details workbook.")
-
+    elif not args.prior_workbook:
+        print("\nNo prior-year official TB workbook was provided, so the build used current-year data only.")

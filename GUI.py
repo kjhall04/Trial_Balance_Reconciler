@@ -418,6 +418,7 @@ class ReconcileWorker(QObject):
 
             summary_map = {str(row["metric"]): row["value"] for _, row in result.summary.iterrows()}
             counts = {
+                "prior_rows": int(summary_map.get("prior-year rows parsed", len(result.prior_year_rows))),
                 "matched": int(summary_map.get("matched to prior year", len(result.matched_rows))),
                 "new_rows": int(summary_map.get("new current-year rows", len(result.new_rows))),
                 "carryforward": int(summary_map.get("carryforward prior-year rows", len(result.carryforward_rows))),
@@ -442,6 +443,7 @@ class ReconcileWorker(QObject):
                         f"{counts['low_confidence']} low."
                     ),
                     "ready_for_import": bool(result.ready_for_import),
+                    "used_prior_comparison": bool(counts["prior_rows"]),
                     "counts": counts,
                     "outputs": {
                         "import": str(out_import),
@@ -662,7 +664,7 @@ class MainWindow(QMainWindow):
         progress_title.setObjectName("SectionTitle")
         bottom_layout.addWidget(progress_title)
 
-        self.status_banner = QLabel("Complete the workbook inputs and output folder to enable reconciliation.", bottom_frame)
+        self.status_banner = QLabel("Complete the current-year workbook inputs and output folder to enable reconciliation.", bottom_frame)
         self.status_banner.setObjectName("StatusBanner")
         self.status_banner.setProperty("tone", "ready")
         self.status_banner.setWordWrap(True)
@@ -731,8 +733,11 @@ class MainWindow(QMainWindow):
     def _validate_prior_inputs(self) -> tuple[bool, list[Path]]:
         prior_paths = [Path(text).expanduser() for text in self.import_card.path_texts()]
         if not prior_paths:
-            self.import_card.set_status("idle", "Drop or browse one or more prior-year trial balance files.")
-            return False, []
+            self.import_card.set_status(
+                "idle",
+                "Optional. Add prior-year official TB workbook files here when you want a last-year comparison.",
+            )
+            return True, []
 
         valid_paths: list[Path] = []
         for path in prior_paths:
@@ -749,7 +754,7 @@ class MainWindow(QMainWindow):
 
         workbook_count = len(valid_paths)
         noun = "file" if workbook_count == 1 else "files"
-        self.import_card.set_status("ok", f"{workbook_count} prior-year trial balance {noun} ready.")
+        self.import_card.set_status("ok", f"{workbook_count} prior-year official TB {noun} ready.")
         return True, valid_paths
 
     def _validate_client_inputs(self) -> tuple[bool, list[Path]]:
@@ -771,53 +776,10 @@ class MainWindow(QMainWindow):
                 return False, []
             valid_paths.append(path)
 
-        try:
-            entity_overrides = parse_entity_overrides(self.entity_overrides_editor.toPlainText())
-        except Exception:
-            self.client_card.set_status(
-                "error",
-                "The company-matching lines could not be read. Use one line per file in FileName=Company Name format.",
-            )
-            return False, []
-
-        for key in entity_overrides:
-            if "=" in key:
-                self.client_card.set_status("error", "On the left side of each line, use only the file path or file name.")
-                return False, []
-
         workbook_count = len(valid_paths)
         noun = "file" if workbook_count == 1 else "files"
         self.client_card.set_status("ok", f"{workbook_count} client trial balance {noun} ready.")
         return True, valid_paths
-
-    def _validate_client_config(self) -> tuple[bool, Path | None]:
-        text = self.client_config_card.path_text()
-        if not text:
-            self.client_config_card.set_status(
-                "idle",
-                "Usually leave this blank. Only use it if you were given a client setup JSON file.",
-            )
-            return True, None
-
-        path = Path(text).expanduser()
-        if not path.exists():
-            self.client_config_card.set_status("error", "The setup file was not found.")
-            return False, None
-        if not path.is_file():
-            self.client_config_card.set_status("error", "The setup path must point to a JSON file.")
-            return False, None
-        if path.suffix.lower() != ".json":
-            self.client_config_card.set_status("error", "Use a JSON setup file here.")
-            return False, None
-
-        try:
-            load_client_config(path)
-        except Exception as exc:  # noqa: BLE001
-            self.client_config_card.set_status("error", f"The setup file could not be read: {exc}")
-            return False, None
-
-        self.client_config_card.set_status("ok", "Setup file is ready.")
-        return True, path
 
     def _validate_output_dir(self) -> tuple[bool, Path | None]:
         text = self.out_dir_card.path_text()
@@ -843,7 +805,6 @@ class MainWindow(QMainWindow):
 
     def _validate_form(self, *_args, update_banner: bool = True) -> bool:
         client_ok, client_paths = self._validate_client_inputs()
-        config_ok, _config_path = self._validate_client_config()
         import_ok, import_paths = self._validate_prior_inputs()
         output_ok, _ = self._validate_output_dir()
 
@@ -861,7 +822,7 @@ class MainWindow(QMainWindow):
                     except OSError:
                         continue
 
-        valid = client_ok and config_ok and import_ok and output_ok
+        valid = client_ok and import_ok and output_ok
         self.run_button.setEnabled(valid and not self.busy)
 
         if update_banner:
@@ -873,12 +834,11 @@ class MainWindow(QMainWindow):
                 message = "Everything looks ready. Start the build whenever you are ready."
             else:
                 tone = "ready"
-                message = "Complete the workbook inputs and output folder to enable reconciliation."
+                message = "Complete the current-year workbook inputs and output folder to enable reconciliation."
 
             self.status_banner.setProperty("tone", tone)
             self.status_banner.setText(message)
             repolish(self.status_banner)
-        self._refresh_setup_preview()
         return valid
 
     def _build_run_config(self) -> RunConfig:
@@ -892,8 +852,6 @@ class MainWindow(QMainWindow):
         ]
         return RunConfig(
             client_specs=client_specs,
-            entity_overrides_text=self.entity_overrides_editor.toPlainText(),
-            client_config_path=Path(self.client_config_card.path_text()).expanduser() if self.client_config_card.path_text() else None,
             prior_specs=prior_specs,
             out_dir=Path(self.out_dir_card.path_text()).expanduser(),
             write_mvp=self.mvp_checkbox.isChecked(),
@@ -903,12 +861,8 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool, preserve_banner: bool = False) -> None:
         self.busy = busy
         self.client_card.set_interactive(not busy)
-        self.client_config_card.set_interactive(not busy)
         self.import_card.set_interactive(not busy)
         self.out_dir_card.set_interactive(not busy)
-        self.entity_overrides_editor.setEnabled(not busy)
-        self.show_advanced_checkbox.setEnabled(not busy)
-        self.advanced_frame.setEnabled(not busy)
         self.mvp_checkbox.setEnabled(not busy)
         self.zero_rows_checkbox.setEnabled(not busy)
         if busy:
@@ -956,10 +910,13 @@ class MainWindow(QMainWindow):
         counts = payload["counts"]
         outputs = payload["outputs"]
         ready_for_import = bool(payload.get("ready_for_import", True))
+        used_prior_comparison = bool(payload.get("used_prior_comparison", False))
 
         self.summary_caption.setText(
             "Import-ready rows: "
             f"{format_count(counts['output_rows'])}\n"
+            "Prior-year rows parsed: "
+            f"{format_count(counts['prior_rows'])}\n"
             "Matched: "
             f"{format_count(counts['matched'])}   "
             "New: "
@@ -1001,11 +958,13 @@ class MainWindow(QMainWindow):
 
         self.progress_bar.setValue(100)
         self.status_banner.setProperty("tone", "good" if ready_for_import else "ready")
-        self.status_banner.setText(
-            "Reconciliation finished successfully."
-            if ready_for_import
-            else "Run completed, but the review queue still needs manual attention before import."
-        )
+        if ready_for_import and used_prior_comparison:
+            message = "Reconciliation finished successfully."
+        elif ready_for_import:
+            message = "Build finished successfully from the current-year files."
+        else:
+            message = "Run completed, but the review queue still needs manual attention before import."
+        self.status_banner.setText(message)
         repolish(self.status_banner)
 
     def _on_worker_error(self, message: str) -> None:
@@ -1035,23 +994,18 @@ class MainWindow(QMainWindow):
 
     def _refresh_recent_lists(self) -> None:
         self.client_card.set_recent_paths(self.settings_store.recent("recent_client_files"))
-        self.client_config_card.set_recent_paths(self.settings_store.recent("recent_client_configs"))
         self.import_card.set_recent_paths(self.settings_store.recent("recent_prior_files"))
         self.out_dir_card.set_recent_paths(self.settings_store.recent("recent_output_dirs"))
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self.client_card.path_text():
             self.settings_store.remember_path("recent_client_files", self.client_card.path_text())
-        if self.client_config_card.path_text():
-            self.settings_store.remember_path("recent_client_configs", self.client_config_card.path_text())
         if self.import_card.path_text():
             self.settings_store.remember_path("recent_prior_files", self.import_card.path_text())
         if self.out_dir_card.path_text():
             self.settings_store.remember_path("recent_output_dirs", self.out_dir_card.path_text())
-        self.settings_store.data["last_entity_overrides"] = self.entity_overrides_editor.toPlainText()
         self.settings_store.data["write_mvp"] = self.mvp_checkbox.isChecked()
         self.settings_store.data["delete_zero_balance_rows"] = self.zero_rows_checkbox.isChecked()
-        self.settings_store.data["show_advanced"] = self.show_advanced_checkbox.isChecked()
         self.settings_store.save()
         super().closeEvent(event)
 
