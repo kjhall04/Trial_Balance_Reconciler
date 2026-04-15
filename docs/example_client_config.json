@@ -1,0 +1,25 @@
+{
+  "name": "Obra Ramos Sample Client",
+  "entity_overrides": {
+    "ORC TB.xlsx": "Obra Ramos Construction, LLC",
+    "ORE TB.xlsx": "Obra Ramos Excavation, LLC",
+    "HR TB.xlsx": "H&R Equipment, Inc."
+  },
+  "workbooks": {
+    "ORC TB.xlsx": {
+      "parser": "quickbooks_debit_credit",
+      "sheet_name": "Sheet1",
+      "entity": "Obra Ramos Construction, LLC"
+    },
+    "ORE TB.xlsx": {
+      "parser": "quickbooks_debit_credit",
+      "sheet_name": "Sheet1",
+      "entity": "Obra Ramos Excavation, LLC"
+    },
+    "HR TB.xlsx": {
+      "parser": "extracted_balance_list",
+      "sheet_name": "Sheet1",
+      "entity": "H&R Equipment, Inc."
+    }
+  }
+}

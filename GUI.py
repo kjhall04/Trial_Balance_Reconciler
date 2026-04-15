@@ -1,5 +1,5 @@
 """
-Modern desktop UI for the Trial Balance Reconciler.
+Modern desktop UI for the Trial Balance Builder.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import QObject, QStandardPaths, QThread, Qt, QUrl, Signal
+    from PySide6.QtCore import QObject, QSize, QStandardPaths, QThread, Qt, QUrl, Signal
     from PySide6.QtGui import QDesktopServices
     from PySide6.QtWidgets import (
         QApplication,
@@ -37,25 +37,26 @@ except ImportError as exc:
         "Install it with: python -m pip install PySide6"
     ) from exc
 
-from final_program import (
+from trial_balance_pipeline import (
+    WorkbookSpec,
+    build_from_workbooks,
     format_outputs,
-    read_client_tb,
-    read_import_tb,
-    reconcile_mvp,
+    split_path_text,
     write_details_workbook,
-    write_import_format,
+    write_import_workbook,
+    write_review_workbook,
 )
 
 
-APP_TITLE = "Trial Balance Reconciler"
+APP_TITLE = "Trial Balance Builder"
 STATE_FILE_NAME = "tb_reconciler_state.json"
 MAX_RECENT_PATHS = 8
 EXCEL_SUFFIXES = {".xlsx", ".xlsm", ".xls"}
-
 APP_STYLESHEET = """
 QWidget { background:#f7f8f4; color:#15231b; font-family:"Segoe UI Variable","Segoe UI",sans-serif; font-size:10pt; }
 QWidget#Root { background:#f7f8f4; }
 QFrame#PathCard, QFrame#SideRail, QFrame#BottomSection { background:transparent; border:none; }
+QFrame#AdvancedPanel { background:#fbfcfa; border:1px solid #d8ddd5; border-radius:18px; }
 QFrame#PathCard { border-bottom:1px solid #d8ddd5; }
 QFrame#PathCard[validationState="ok"] { border-bottom:2px solid #5e816d; }
 QFrame#PathCard[validationState="warning"] { border-bottom:2px solid #b08b43; }
@@ -90,6 +91,7 @@ QLabel#StatusBanner[tone="error"] { color:#a54b3d; }
 QCheckBox#Toggle { color:#1f3c2e; font-weight:600; spacing:10px; }
 QCheckBox#Toggle::indicator { width:20px; height:20px; border-radius:10px; border:1px solid #cdd4ca; background:#ffffff; }
 QCheckBox#Toggle::indicator:checked { background:#2f6b4f; border:1px solid #2f6b4f; }
+QPlainTextEdit#PreviewPanel { background:white; color:#33443b; border:1px solid #d5ddd4; border-radius:12px; padding:12px; }
 """
 
 
@@ -118,10 +120,11 @@ def make_local_link(path: Path) -> str:
 
 @dataclass
 class RunConfig:
-    client_path: Path
-    import_path: Path
+    client_specs: list[WorkbookSpec]
+    prior_specs: list[WorkbookSpec]
     out_dir: Path
     write_mvp: bool
+    delete_zero_balance_rows: bool
 
 
 class SettingsStore:
@@ -137,9 +140,10 @@ class SettingsStore:
     def _default_data(self) -> dict:
         return {
             "recent_client_files": [],
-            "recent_import_files": [],
+            "recent_prior_files": [],
             "recent_output_dirs": [],
             "write_mvp": True,
+            "delete_zero_balance_rows": True,
         }
 
     def _load(self) -> dict:
@@ -155,6 +159,8 @@ class SettingsStore:
             value = raw.get(key, default)
             if isinstance(default, list) and isinstance(value, list):
                 data[key] = [str(item) for item in value if str(item).strip()]
+            elif isinstance(default, str):
+                data[key] = str(value)
             elif isinstance(default, bool):
                 data[key] = bool(value)
         return data
@@ -184,14 +190,20 @@ class SettingsStore:
         self.save()
 
     def remember_run_config(self, cfg: RunConfig) -> None:
-        self.remember_path("recent_client_files", str(cfg.client_path))
-        self.remember_path("recent_import_files", str(cfg.import_path))
+        joined_client_paths = " | ".join(str(spec.path) for spec in cfg.client_specs)
+        joined_prior_paths = " | ".join(str(spec.path) for spec in cfg.prior_specs)
+        self.remember_path("recent_client_files", joined_client_paths)
+        self.remember_path("recent_prior_files", joined_prior_paths)
         self.remember_path("recent_output_dirs", str(cfg.out_dir))
         self.data["write_mvp"] = bool(cfg.write_mvp)
+        self.data["delete_zero_balance_rows"] = bool(cfg.delete_zero_balance_rows)
         self.save()
 
     def write_mvp_default(self) -> bool:
         return bool(self.data.get("write_mvp", True))
+
+    def delete_zero_balance_rows_default(self) -> bool:
+        return bool(self.data.get("delete_zero_balance_rows", True))
 
 
 class DropPathCard(QFrame):
@@ -205,16 +217,18 @@ class DropPathCard(QFrame):
         button_text: str,
         browse_kind: str,
         file_filter: str = "All files (*)",
+        allow_multiple: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.browse_kind = browse_kind
         self.file_filter = file_filter
+        self.allow_multiple = allow_multiple
         self.setObjectName("PathCard")
         self.setProperty("validationState", "idle")
         self.setAcceptDrops(True)
         self.setMinimumHeight(116)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 10, 0, 12)
@@ -245,6 +259,9 @@ class DropPathCard(QFrame):
 
         self.browse_button = QPushButton(button_text, self)
         self.browse_button.setObjectName("SecondaryButton")
+        browse_size = self.browse_button.sizeHint()
+        self.browse_button.setFixedWidth(browse_size.width())
+        self.browse_button.setFixedHeight(browse_size.height() + 2)
         self.browse_button.clicked.connect(self._browse)
         input_row.addWidget(self.browse_button)
 
@@ -254,6 +271,22 @@ class DropPathCard(QFrame):
         self.status_label.setWordWrap(True)
         self.status_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         layout.addWidget(self.status_label)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        layout = self.layout()
+        if layout is None:
+            return super().heightForWidth(width)
+        return max(self.minimumHeight(), layout.totalHeightForWidth(max(0, width)))
+
+    def sizeHint(self) -> QSize:
+        layout = self.layout()
+        if layout is None:
+            return super().sizeHint()
+        hint = layout.sizeHint()
+        return QSize(hint.width(), max(self.minimumHeight(), hint.height()))
 
     def set_recent_paths(self, paths: list[str]) -> None:
         current = self.path_text()
@@ -268,6 +301,12 @@ class DropPathCard(QFrame):
 
     def path_text(self) -> str:
         return self.combo.currentText().strip()
+
+    def path_texts(self) -> list[str]:
+        if self.allow_multiple:
+            return split_path_text(self.path_text())
+        text = self.path_text()
+        return [text] if text else []
 
     def set_status(self, tone: str, message: str) -> None:
         self.setProperty("validationState", tone)
@@ -293,6 +332,9 @@ class DropPathCard(QFrame):
         start_dir = self._suggest_dialog_start()
         if self.browse_kind == "directory":
             chosen = QFileDialog.getExistingDirectory(self, "Select output folder", start_dir)
+        elif self.allow_multiple:
+            chosen_paths, _ = QFileDialog.getOpenFileNames(self, "Select workbooks", start_dir, self.file_filter)
+            chosen = " | ".join(chosen_paths)
         else:
             chosen, _ = QFileDialog.getOpenFileName(self, "Select workbook", start_dir, self.file_filter)
         if chosen:
@@ -307,12 +349,17 @@ class DropPathCard(QFrame):
         event.ignore()
 
     def dropEvent(self, event) -> None:  # type: ignore[override]
+        dropped_paths: list[str] = []
         for url in event.mimeData().urls():
             if not url.isLocalFile():
                 continue
             dropped = Path(url.toLocalFile())
             target = dropped if self.browse_kind == "file" else (dropped if dropped.is_dir() else dropped.parent)
-            self.set_path(str(target))
+            dropped_paths.append(str(target))
+
+        if dropped_paths:
+            value = " | ".join(dropped_paths) if self.allow_multiple else dropped_paths[0]
+            self.set_path(value)
             event.acceptProposedAction()
             return
         event.ignore()
@@ -330,7 +377,7 @@ class ReconcileWorker(QObject):
         self.cfg = cfg
 
     def run(self) -> None:
-        total_steps = 7 if self.cfg.write_mvp else 6
+        total_steps = 6 if self.cfg.write_mvp else 5
         current_step = 0
 
         def advance(message: str) -> None:
@@ -344,43 +391,43 @@ class ReconcileWorker(QObject):
             advance("Preparing output folder...")
             self.cfg.out_dir.mkdir(parents=True, exist_ok=True)
             out_import = self.cfg.out_dir / "tb_to_import_updated.xlsx"
-            out_details = self.cfg.out_dir / "tb_mvp_details.xlsx"
+            out_details = self.cfg.out_dir / "tb_build_details.xlsx"
+            out_review = self.cfg.out_dir / "tb_review_style.xlsx"
 
-            advance("Reading client TB workbook...")
-            client_df = read_client_tb(self.cfg.client_path)
-            advance("Reading import workbook...")
-            import_df = read_import_tb(self.cfg.import_path)
-            advance("Reconciling accounts and balances...")
-            result = reconcile_mvp(client_df, import_df)
+            advance("Reading workbook data...")
+            result = build_from_workbooks(
+                current_specs=self.cfg.client_specs,
+                prior_specs=self.cfg.prior_specs,
+                keep_zero_rows=not self.cfg.delete_zero_balance_rows,
+            )
             advance("Writing import-ready workbook...")
-            write_import_format(result.updated_import, out_import)
+            write_import_workbook(result.updated_import, out_import)
 
             if self.cfg.write_mvp:
-                advance("Writing detailed review workbook...")
+                advance("Writing audit details workbook...")
                 write_details_workbook(result, out_details)
+                advance("Writing review-style workbook...")
+                write_review_workbook(result.updated_import, out_review, "Review Trial Balance")
 
             advance("Applying final workbook formatting...")
-            new_accts: set[int] = set()
-            if len(result.new_rows_added) and "acct_no" in result.new_rows_added.columns:
-                new_accts = set(result.new_rows_added["acct_no"].dropna().astype(float).astype(int).tolist())
-
             format_outputs(
                 out_import,
                 out_details if self.cfg.write_mvp else None,
-                None,
-                new_accts=new_accts,
-                changed_balance_rows=result.changed_existing_rows,
-                renamed_rows=result.renamed_existing_rows,
+                out_review if self.cfg.write_mvp else None,
             )
 
             summary_map = {str(row["metric"]): row["value"] for _, row in result.summary.iterrows()}
             counts = {
-                "renamed": len(result.renamed_existing_rows),
-                "changed": len(result.changed_existing_rows),
-                "added": len(result.new_rows_added),
-                "removed": len(result.removed_import_rows),
+                "matched": int(summary_map.get("matched to prior year", len(result.matched_rows))),
+                "new_rows": int(summary_map.get("new current-year rows", len(result.new_rows))),
+                "carryforward": int(summary_map.get("carryforward prior-year rows", len(result.carryforward_rows))),
+                "renumbered": int(summary_map.get("renumbered rows", len(result.renumbered_rows))),
+                "review_queue": int(summary_map.get("review queue rows", len(result.review_queue))),
+                "high_confidence": int(summary_map.get("high-confidence rows", 0)),
+                "medium_confidence": int(summary_map.get("medium-confidence rows", 0)),
+                "low_confidence": int(summary_map.get("low-confidence rows", 0)),
                 "output_rows": int(summary_map.get("output row count", len(result.updated_import))),
-                "zero_balance_removed": int(summary_map.get("deleted zero-balance import rows", 0)),
+                "current_total": float(summary_map.get("output current-year total", float(result.updated_import["cy_balance"].sum()))),
             }
             self.progress.emit(100, "Completed.")
             self.log.emit("Completed successfully.")
@@ -388,13 +435,18 @@ class ReconcileWorker(QObject):
                 {
                     "headline": (
                         f"Run complete. {counts['output_rows']} rows are ready for import, with "
-                        f"{counts['renamed']} renamed, {counts['changed']} changed, "
-                        f"{counts['added']} added, and {counts['removed']} removed."
+                        f"{counts['matched']} matched to prior year, {counts['new_rows']} new, "
+                        f"{counts['carryforward']} carried forward, {counts['renumbered']} renumbered, "
+                        f"and {counts['review_queue']} waiting for review. Confidence levels: "
+                        f"{counts['high_confidence']} high, {counts['medium_confidence']} medium, "
+                        f"{counts['low_confidence']} low."
                     ),
+                    "ready_for_import": bool(result.ready_for_import),
                     "counts": counts,
                     "outputs": {
                         "import": str(out_import),
                         "details": str(out_details) if self.cfg.write_mvp else "",
+                        "review": str(out_review) if self.cfg.write_mvp else "",
                         "folder": str(self.cfg.out_dir),
                     },
                 }
@@ -402,7 +454,7 @@ class ReconcileWorker(QObject):
         except PermissionError as exc:
             self.error.emit(
                 "Permission denied while writing an output workbook.\n"
-                "Close any open Excel copies of tb_to_import_updated.xlsx or tb_mvp_details.xlsx, then run again.\n\n"
+                "Close any open Excel copies of tb_to_import_updated.xlsx, tb_build_details.xlsx, or tb_review_style.xlsx, then run again.\n\n"
                 f"Details: {exc}"
             )
         except Exception as exc:  # noqa: BLE001
@@ -456,7 +508,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(title)
 
         subtitle = QLabel(
-            "Choose the files, pick an output folder, then run reconcile.",
+            "Choose the current-year files, optional prior-year official TB files, and an output folder. The program builds a fresh trial balance, compares it to last year when those official TB workbooks are provided, and adds confidence highlighting plus an audit trail workbook.",
             content,
         )
         subtitle.setObjectName("PageSubtitle")
@@ -485,28 +537,39 @@ class MainWindow(QMainWindow):
         main_column.addWidget(files_title)
 
         self.client_card = DropPathCard(
-            "Client TB workbook",
-            "Drop the client trial balance here or pick it from your recent files list.",
-            "C:\\path\\to\\client tb.xlsx",
+            "Client trial balance file(s)",
+            "Choose the current-year trial balance files you received from the client. If the job should be combined into one final TB, add every current-year file here.",
+            "C:\\path\\to\\client tb.xlsx | C:\\path\\to\\ORE TB.xlsx",
             "Browse",
             "file",
             "Excel files (*.xlsx *.xlsm *.xls)",
-            root,
+            allow_multiple=True,
+            parent=root,
         )
         self.client_card.pathChanged.connect(self._validate_form)
         main_column.addWidget(self.client_card)
 
         self.import_card = DropPathCard(
-            "TB to import workbook",
-            "Choose the import template workbook that should be updated with the reconciled results.",
-            "C:\\path\\to\\tb to import.xlsx",
+            "Prior-year official TB file(s) (Optional)",
+            "Choose the previous year's official trial balance workbook(s) that the new trial balance should line up against. Do not use last year's TB import workbook here.",
+            "C:\\path\\to\\2022 Trial Balance.xlsx | C:\\path\\to\\HR 2022 Trial Balance.xlsx",
             "Browse",
             "file",
             "Excel files (*.xlsx *.xlsm *.xls)",
-            root,
+            allow_multiple=True,
+            parent=root,
         )
         self.import_card.pathChanged.connect(self._validate_form)
         main_column.addWidget(self.import_card)
+
+        prior_note = QLabel(
+            "Leave the prior-year field blank if you only want to build from the current-year files. The run will still finish, but unmatched rows will stay flagged for review.",
+            content,
+        )
+        prior_note.setObjectName("SectionBody")
+        prior_note.setWordWrap(True)
+        prior_note.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        main_column.addWidget(prior_note)
 
         self.out_dir_card = DropPathCard(
             "Output folder",
@@ -523,16 +586,21 @@ class MainWindow(QMainWindow):
         options_title.setObjectName("SectionTitle")
         side_layout.addWidget(options_title)
 
-        self.mvp_checkbox = QCheckBox("Create detailed review workbook", side_frame)
+        self.mvp_checkbox = QCheckBox("Create audit details workbook", side_frame)
         self.mvp_checkbox.setObjectName("Toggle")
         self.mvp_checkbox.toggled.connect(self._update_output_hint)
         side_layout.addWidget(self.mvp_checkbox)
+
+        self.zero_rows_checkbox = QCheckBox("Remove zero-balance rows from final file", side_frame)
+        self.zero_rows_checkbox.setObjectName("Toggle")
+        self.zero_rows_checkbox.toggled.connect(self._update_output_hint)
+        side_layout.addWidget(self.zero_rows_checkbox)
 
         self.output_hint_label = QLabel(side_frame)
         self.output_hint_label.setObjectName("SectionBody")
         self.output_hint_label.setWordWrap(True)
         self.output_hint_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self.output_hint_label.setMinimumHeight(58)
+        self.output_hint_label.setMinimumHeight(76)
         self.output_hint_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         side_layout.addWidget(self.output_hint_label)
 
@@ -540,7 +608,7 @@ class MainWindow(QMainWindow):
         run_title.setObjectName("SectionTitle")
         side_layout.addWidget(run_title)
 
-        self.run_button = QPushButton("Run Reconcile", side_frame)
+        self.run_button = QPushButton("Build Trial Balance", side_frame)
         self.run_button.setObjectName("PrimaryButton")
         self.run_button.setMinimumHeight(56)
         self.run_button.setMinimumWidth(220)
@@ -566,7 +634,7 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(summary_title)
 
         self.summary_caption = QLabel(
-            "Run the workflow to see a simple summary of renamed, changed, added, and removed rows.",
+            "Run the workflow to see a simple summary of matched, new, carryforward, and renumbered rows.",
             side_frame,
         )
         self.summary_caption.setObjectName("SummaryCaption")
@@ -594,7 +662,7 @@ class MainWindow(QMainWindow):
         progress_title.setObjectName("SectionTitle")
         bottom_layout.addWidget(progress_title)
 
-        self.status_banner = QLabel("Complete the three inputs to enable reconciliation.", bottom_frame)
+        self.status_banner = QLabel("Complete the workbook inputs and output folder to enable reconciliation.", bottom_frame)
         self.status_banner.setObjectName("StatusBanner")
         self.status_banner.setProperty("tone", "ready")
         self.status_banner.setWordWrap(True)
@@ -622,7 +690,7 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self) -> None:
         client_recent = self.settings_store.recent("recent_client_files")
-        import_recent = self.settings_store.recent("recent_import_files")
+        import_recent = self.settings_store.recent("recent_prior_files")
         out_recent = self.settings_store.recent("recent_output_dirs")
 
         self.client_card.set_recent_paths(client_recent)
@@ -633,39 +701,122 @@ class MainWindow(QMainWindow):
         self.import_card.set_path("")
         self.out_dir_card.set_path(out_recent[0] if out_recent else str(Path.cwd()))
         self.mvp_checkbox.setChecked(self.settings_store.write_mvp_default())
+        self.zero_rows_checkbox.setChecked(self.settings_store.delete_zero_balance_rows_default())
 
     def _update_output_hint(self, *_args) -> None:
+        zero_row_policy = (
+            "Zero-balance rows: deleted from the final import workbook"
+            if self.zero_rows_checkbox.isChecked()
+            else "Zero-balance rows: kept in the final import workbook"
+        )
         if self.mvp_checkbox.isChecked():
             self.output_hint_label.setText(
                 "Creates:\n"
                 "tb_to_import_updated.xlsx\n"
-                "tb_mvp_details.xlsx"
+                "tb_build_details.xlsx\n"
+                "tb_review_style.xlsx\n"
+                "Confidence colors: green/high, yellow/medium, red/low\n"
+                "Single combined TB output hides the entity column automatically\n"
+                f"{zero_row_policy}"
             )
         else:
             self.output_hint_label.setText(
                 "Creates:\n"
                 "tb_to_import_updated.xlsx\n"
-                "Review workbook skipped"
+                "Audit details and review workbooks skipped\n"
+                "Single combined TB output hides the entity column automatically\n"
+                f"{zero_row_policy}"
             )
 
-    def _validate_excel_path(self, card: DropPathCard, role_label: str) -> tuple[bool, Path | None]:
-        text = card.path_text()
+    def _validate_prior_inputs(self) -> tuple[bool, list[Path]]:
+        prior_paths = [Path(text).expanduser() for text in self.import_card.path_texts()]
+        if not prior_paths:
+            self.import_card.set_status("idle", "Drop or browse one or more prior-year trial balance files.")
+            return False, []
+
+        valid_paths: list[Path] = []
+        for path in prior_paths:
+            if not path.exists():
+                self.import_card.set_status("error", f"Prior-year trial balance file was not found: {path}")
+                return False, []
+            if not path.is_file():
+                self.import_card.set_status("error", "Each prior-year path must point to an Excel workbook.")
+                return False, []
+            if path.suffix.lower() not in EXCEL_SUFFIXES:
+                self.import_card.set_status("error", "Use Excel files with .xlsx, .xlsm, or .xls extensions.")
+                return False, []
+            valid_paths.append(path)
+
+        workbook_count = len(valid_paths)
+        noun = "file" if workbook_count == 1 else "files"
+        self.import_card.set_status("ok", f"{workbook_count} prior-year trial balance {noun} ready.")
+        return True, valid_paths
+
+    def _validate_client_inputs(self) -> tuple[bool, list[Path]]:
+        raw_paths = [Path(text).expanduser() for text in self.client_card.path_texts()]
+        if not raw_paths:
+            self.client_card.set_status("idle", "Drop or browse one or more client trial balance files.")
+            return False, []
+
+        valid_paths: list[Path] = []
+        for path in raw_paths:
+            if not path.exists():
+                self.client_card.set_status("error", f"Client trial balance file was not found: {path}")
+                return False, []
+            if not path.is_file():
+                self.client_card.set_status("error", "Each client trial balance path must point to an Excel workbook.")
+                return False, []
+            if path.suffix.lower() not in EXCEL_SUFFIXES:
+                self.client_card.set_status("error", "Use Excel files with .xlsx, .xlsm, or .xls extensions.")
+                return False, []
+            valid_paths.append(path)
+
+        try:
+            entity_overrides = parse_entity_overrides(self.entity_overrides_editor.toPlainText())
+        except Exception:
+            self.client_card.set_status(
+                "error",
+                "The company-matching lines could not be read. Use one line per file in FileName=Company Name format.",
+            )
+            return False, []
+
+        for key in entity_overrides:
+            if "=" in key:
+                self.client_card.set_status("error", "On the left side of each line, use only the file path or file name.")
+                return False, []
+
+        workbook_count = len(valid_paths)
+        noun = "file" if workbook_count == 1 else "files"
+        self.client_card.set_status("ok", f"{workbook_count} client trial balance {noun} ready.")
+        return True, valid_paths
+
+    def _validate_client_config(self) -> tuple[bool, Path | None]:
+        text = self.client_config_card.path_text()
         if not text:
-            card.set_status("idle", f"Drop or browse the {role_label.lower()} workbook.")
-            return False, None
+            self.client_config_card.set_status(
+                "idle",
+                "Usually leave this blank. Only use it if you were given a client setup JSON file.",
+            )
+            return True, None
 
         path = Path(text).expanduser()
         if not path.exists():
-            card.set_status("error", f"{role_label} workbook was not found.")
+            self.client_config_card.set_status("error", "The setup file was not found.")
             return False, None
         if not path.is_file():
-            card.set_status("error", f"{role_label} path must point to an Excel workbook.")
+            self.client_config_card.set_status("error", "The setup path must point to a JSON file.")
             return False, None
-        if path.suffix.lower() not in EXCEL_SUFFIXES:
-            card.set_status("error", "Use an Excel file with .xlsx, .xlsm, or .xls extension.")
+        if path.suffix.lower() != ".json":
+            self.client_config_card.set_status("error", "Use a JSON setup file here.")
             return False, None
 
-        card.set_status("ok", f"{role_label} workbook is ready.")
+        try:
+            load_client_config(path)
+        except Exception as exc:  # noqa: BLE001
+            self.client_config_card.set_status("error", f"The setup file could not be read: {exc}")
+            return False, None
+
+        self.client_config_card.set_status("ok", "Setup file is ready.")
         return True, path
 
     def _validate_output_dir(self) -> tuple[bool, Path | None]:
@@ -691,22 +842,26 @@ class MainWindow(QMainWindow):
         return False, None
 
     def _validate_form(self, *_args, update_banner: bool = True) -> bool:
-        client_ok, client_path = self._validate_excel_path(self.client_card, "Client TB")
-        import_ok, import_path = self._validate_excel_path(self.import_card, "Import")
+        client_ok, client_paths = self._validate_client_inputs()
+        config_ok, _config_path = self._validate_client_config()
+        import_ok, import_paths = self._validate_prior_inputs()
         output_ok, _ = self._validate_output_dir()
 
-        if client_ok and import_ok and client_path and import_path:
-            try:
-                if client_path.resolve() == import_path.resolve():
-                    self.import_card.set_status(
-                        "error",
-                        "Choose a different workbook here so the client TB and import template are not the same file.",
-                    )
-                    import_ok = False
-            except OSError:
-                pass
+        if client_ok and import_ok and client_paths and import_paths:
+            for client_path in client_paths:
+                for prior_path in import_paths:
+                    try:
+                        if client_path.resolve() == prior_path.resolve():
+                            self.import_card.set_status(
+                                "error",
+                                "Choose different files here so the current-year workbooks and prior-year workbooks are not the same file.",
+                            )
+                            import_ok = False
+                            break
+                    except OSError:
+                        continue
 
-        valid = client_ok and import_ok and output_ok
+        valid = client_ok and config_ok and import_ok and output_ok
         self.run_button.setEnabled(valid and not self.busy)
 
         if update_banner:
@@ -715,30 +870,47 @@ class MainWindow(QMainWindow):
                 message = "Reconciliation is running. Follow the progress log below."
             elif valid:
                 tone = "good"
-                message = "Everything looks ready. Start the reconcile run whenever you are ready."
+                message = "Everything looks ready. Start the build whenever you are ready."
             else:
                 tone = "ready"
-                message = "Complete the three inputs to enable reconciliation."
+                message = "Complete the workbook inputs and output folder to enable reconciliation."
 
             self.status_banner.setProperty("tone", tone)
             self.status_banner.setText(message)
             repolish(self.status_banner)
+        self._refresh_setup_preview()
         return valid
 
     def _build_run_config(self) -> RunConfig:
+        client_specs = [
+            WorkbookSpec(path=Path(text).expanduser())
+            for text in self.client_card.path_texts()
+        ]
+        prior_specs = [
+            WorkbookSpec(path=Path(text).expanduser())
+            for text in self.import_card.path_texts()
+        ]
         return RunConfig(
-            client_path=Path(self.client_card.path_text()).expanduser(),
-            import_path=Path(self.import_card.path_text()).expanduser(),
+            client_specs=client_specs,
+            entity_overrides_text=self.entity_overrides_editor.toPlainText(),
+            client_config_path=Path(self.client_config_card.path_text()).expanduser() if self.client_config_card.path_text() else None,
+            prior_specs=prior_specs,
             out_dir=Path(self.out_dir_card.path_text()).expanduser(),
             write_mvp=self.mvp_checkbox.isChecked(),
+            delete_zero_balance_rows=self.zero_rows_checkbox.isChecked(),
         )
 
     def _set_busy(self, busy: bool, preserve_banner: bool = False) -> None:
         self.busy = busy
         self.client_card.set_interactive(not busy)
+        self.client_config_card.set_interactive(not busy)
         self.import_card.set_interactive(not busy)
         self.out_dir_card.set_interactive(not busy)
+        self.entity_overrides_editor.setEnabled(not busy)
+        self.show_advanced_checkbox.setEnabled(not busy)
+        self.advanced_frame.setEnabled(not busy)
         self.mvp_checkbox.setEnabled(not busy)
+        self.zero_rows_checkbox.setEnabled(not busy)
         if busy:
             self.run_button.setEnabled(False)
         else:
@@ -753,7 +925,7 @@ class MainWindow(QMainWindow):
         self.settings_store.remember_run_config(cfg)
         self._refresh_recent_lists()
 
-        self._append_log("Starting reconcile run.")
+        self._append_log("Starting trial-balance build.")
         self._set_busy(True)
         self.progress_bar.setValue(0)
         self.open_output_button.setEnabled(False)
@@ -783,24 +955,32 @@ class MainWindow(QMainWindow):
     def _on_worker_success(self, payload: dict) -> None:
         counts = payload["counts"]
         outputs = payload["outputs"]
+        ready_for_import = bool(payload.get("ready_for_import", True))
 
         self.summary_caption.setText(
             "Import-ready rows: "
             f"{format_count(counts['output_rows'])}\n"
-            "Renamed: "
-            f"{format_count(counts['renamed'])}   "
-            "Changed: "
-            f"{format_count(counts['changed'])}   "
-            "Added: "
-            f"{format_count(counts['added'])}   "
-            "Removed: "
-            f"{format_count(counts['removed'])}\n"
-            "Zero-balance removals: "
-            f"{format_count(counts['zero_balance_removed'])}"
+            "Matched: "
+            f"{format_count(counts['matched'])}   "
+            "New: "
+            f"{format_count(counts['new_rows'])}   "
+            "Carryforward: "
+            f"{format_count(counts['carryforward'])}   "
+            "Renumbered: "
+            f"{format_count(counts['renumbered'])}   "
+            "Review Queue: "
+            f"{format_count(counts['review_queue'])}\n"
+            "Confidence: "
+            f"{format_count(counts['high_confidence'])} high   "
+            f"{format_count(counts['medium_confidence'])} medium   "
+            f"{format_count(counts['low_confidence'])} low\n"
+            "Current-year total: "
+            f"{counts['current_total']:,.2f}"
         )
 
         import_path = Path(outputs["import"])
         details_path = Path(outputs["details"]) if outputs["details"] else None
+        review_path = Path(outputs["review"]) if outputs.get("review") else None
         folder_path = Path(outputs["folder"])
         self.latest_output_dir = folder_path
         self.open_output_button.setEnabled(True)
@@ -810,14 +990,22 @@ class MainWindow(QMainWindow):
             f"Output folder: {make_local_link(folder_path)}",
         ]
         if details_path is not None:
-            lines.insert(1, f"Details workbook: {make_local_link(details_path)}")
+            lines.insert(1, f"Audit details workbook: {make_local_link(details_path)}")
         else:
-            lines.insert(1, "Details workbook: skipped for this run.")
+            lines.insert(1, "Audit details workbook: skipped for this run.")
+        if review_path is not None:
+            lines.insert(2, f"Review workbook: {make_local_link(review_path)}")
+        else:
+            lines.insert(2, "Review workbook: skipped for this run.")
         self.outputs_label.setText("<br>".join(lines))
 
         self.progress_bar.setValue(100)
-        self.status_banner.setProperty("tone", "good")
-        self.status_banner.setText("Reconciliation finished successfully.")
+        self.status_banner.setProperty("tone", "good" if ready_for_import else "ready")
+        self.status_banner.setText(
+            "Reconciliation finished successfully."
+            if ready_for_import
+            else "Run completed, but the review queue still needs manual attention before import."
+        )
         repolish(self.status_banner)
 
     def _on_worker_error(self, message: str) -> None:
@@ -847,17 +1035,23 @@ class MainWindow(QMainWindow):
 
     def _refresh_recent_lists(self) -> None:
         self.client_card.set_recent_paths(self.settings_store.recent("recent_client_files"))
-        self.import_card.set_recent_paths(self.settings_store.recent("recent_import_files"))
+        self.client_config_card.set_recent_paths(self.settings_store.recent("recent_client_configs"))
+        self.import_card.set_recent_paths(self.settings_store.recent("recent_prior_files"))
         self.out_dir_card.set_recent_paths(self.settings_store.recent("recent_output_dirs"))
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self.client_card.path_text():
             self.settings_store.remember_path("recent_client_files", self.client_card.path_text())
+        if self.client_config_card.path_text():
+            self.settings_store.remember_path("recent_client_configs", self.client_config_card.path_text())
         if self.import_card.path_text():
-            self.settings_store.remember_path("recent_import_files", self.import_card.path_text())
+            self.settings_store.remember_path("recent_prior_files", self.import_card.path_text())
         if self.out_dir_card.path_text():
             self.settings_store.remember_path("recent_output_dirs", self.out_dir_card.path_text())
+        self.settings_store.data["last_entity_overrides"] = self.entity_overrides_editor.toPlainText()
         self.settings_store.data["write_mvp"] = self.mvp_checkbox.isChecked()
+        self.settings_store.data["delete_zero_balance_rows"] = self.zero_rows_checkbox.isChecked()
+        self.settings_store.data["show_advanced"] = self.show_advanced_checkbox.isChecked()
         self.settings_store.save()
         super().closeEvent(event)
 
