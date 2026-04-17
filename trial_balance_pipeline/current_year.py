@@ -278,6 +278,12 @@ def read_current_workbooks(
         path = spec.path.expanduser()
         entity, _ = _resolve_entity(spec, path, client_config, entity_overrides, known_entities or [])
         rule = workbook_rule_for_path(client_config, path)
+        has_manual_override = False
+        if entity_overrides:
+            for key in (str(path).lower(), path.name.lower(), path.stem.lower()):
+                if key in entity_overrides:
+                    has_manual_override = True
+                    break
         sheet_name, _ = _choose_sheet(path, rule.sheet_name)
         parser_name = rule.parser or _detect_parser(path, sheet_name)[0]
 
@@ -290,7 +296,7 @@ def read_current_workbooks(
                 observed_entities = [clean_text(value) for value in df["entity_value"].unique().tolist() if clean_text(value)]
                 if len(observed_entities) == 1:
                     entity = observed_entities[0]
-                elif observed_entities and not spec.entity and not rule.entity and not entity_overrides:
+                elif observed_entities and not spec.entity and not rule.entity and not has_manual_override:
                     entity = observed_entities[0]
         else:
             raise ValueError(f"Unsupported current-year parser '{parser_name}'.")

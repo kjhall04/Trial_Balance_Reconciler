@@ -17,6 +17,9 @@ CONFIDENCE_FONT_COLORS = {
     "medium": "B8860B",
     "low": "C62828",
 }
+ACCOUNTING_NUMBER_FORMAT = '#,##0.00;(#,##0.00);-'
+DETAIL_BALANCE_HEADERS = {"py_balance", "cy_balance"}
+REVIEW_BALANCE_HEADERS = {"previous year rep", "current year prelim", "ajes", "final"}
 
 
 def _is_multi_entity(df: pd.DataFrame) -> bool:
@@ -91,6 +94,48 @@ def _color_sheet_from_confidence_column(sheet) -> None:
             continue
         for column_number in target_columns:
             _set_font_color(sheet.cell(row=row_number, column=column_number), color)
+
+
+def _normalized_header(value: object) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().lower().split())
+
+
+def _balance_columns_for_sheet(sheet) -> set[int]:
+    if sheet.title == SHEET_NAME:
+        review_headers = {_normalized_header(cell.value): cell.column for cell in sheet[3] if cell.value is not None}
+        review_balance_columns = {
+            column
+            for header, column in review_headers.items()
+            if header in REVIEW_BALANCE_HEADERS
+        }
+        if review_balance_columns:
+            return review_balance_columns
+
+        if sheet.max_column >= 2:
+            return {sheet.max_column - 1, sheet.max_column}
+        return set()
+
+    headers = {_normalized_header(cell.value): cell.column for cell in sheet[1] if cell.value is not None}
+    return {
+        column
+        for header, column in headers.items()
+        if header in DETAIL_BALANCE_HEADERS
+    }
+
+
+def _apply_balance_number_format(sheet) -> None:
+    balance_columns = _balance_columns_for_sheet(sheet)
+    if not balance_columns:
+        return
+
+    for row in sheet.iter_rows():
+        for cell in row:
+            if cell.column not in balance_columns:
+                continue
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = ACCOUNTING_NUMBER_FORMAT
 
 
 def write_import_workbook(df: pd.DataFrame, out_path: Path, sheet_name: str = SHEET_NAME) -> None:
@@ -217,6 +262,7 @@ def format_workbook(path: str | Path, *, freeze_panes: str | None = None, max_wi
                     cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
                     if isinstance(cell.value, (int, float)) and cell.column >= max(sheet.max_column - 1, 1):
                         cell.alignment = Alignment(horizontal="right", vertical="top")
+            _apply_balance_number_format(sheet)
             _color_sheet_from_confidence_column(sheet)
             for column, width in widths.items():
                 sheet.column_dimensions[get_column_letter(column)].width = width

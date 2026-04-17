@@ -1,3 +1,12 @@
+from .assistance import (
+    PreflightItem,
+    build_memory_client_config,
+    build_preflight_items,
+    default_user_memory,
+    known_entities_from_memory,
+    remember_successful_workbooks,
+    sanitize_user_memory,
+)
 from .cli import main
 from .config import load_client_config, parse_entity_overrides, split_path_text
 from .current_year import (
@@ -15,17 +24,22 @@ from .workflow import build_from_workbooks
 
 __all__ = [
     "ClientConfig",
+    "PreflightItem",
     "TrialBalanceBuildResult",
     "WorkbookPreview",
     "WorkbookRule",
     "WorkbookSpec",
     "available_current_parser_profiles",
+    "build_memory_client_config",
+    "build_preflight_items",
     "build_client_config_template",
     "build_from_workbooks",
     "build_trial_balance",
     "clean_account_name",
     "clean_account_number",
+    "default_user_memory",
     "format_outputs",
+    "known_entities_from_memory",
     "load_client_config",
     "main",
     "parse_entity_overrides",
@@ -33,10 +47,11 @@ __all__ = [
     "read_current_workbooks",
     "read_prior_workbooks",
     "read_review_tb",
+    "remember_successful_workbooks",
+    "sanitize_user_memory",
     "split_path_text",
     "standard_account_number",
     "write_details_workbook",
     "write_import_workbook",
     "write_review_workbook",
 ]
-

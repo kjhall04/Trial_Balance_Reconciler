@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +18,8 @@ try:
         QApplication,
         QCheckBox,
         QComboBox,
+        QDialog,
+        QDialogButtonBox,
         QFileDialog,
         QFrame,
         QHBoxLayout,
@@ -38,9 +40,19 @@ except ImportError as exc:
     ) from exc
 
 from trial_balance_pipeline import (
+    ClientConfig,
+    PreflightItem,
     WorkbookSpec,
+    build_memory_client_config,
+    build_preflight_items,
     build_from_workbooks,
+    default_user_memory,
     format_outputs,
+    known_entities_from_memory,
+    preview_current_workbooks,
+    read_prior_workbooks,
+    remember_successful_workbooks,
+    sanitize_user_memory,
     split_path_text,
     write_details_workbook,
     write_import_workbook,
@@ -50,6 +62,7 @@ from trial_balance_pipeline import (
 
 APP_TITLE = "Trial Balance Builder"
 STATE_FILE_NAME = "tb_reconciler_state.json"
+USER_GUIDE_PATH = Path(__file__).resolve().parent / "docs" / "trial_balance_builder_guide.pdf"
 MAX_RECENT_PATHS = 8
 EXCEL_SUFFIXES = {".xlsx", ".xlsm", ".xls"}
 APP_STYLESHEET = """
@@ -125,6 +138,9 @@ class RunConfig:
     out_dir: Path
     write_mvp: bool
     delete_zero_balance_rows: bool
+    client_config: ClientConfig | None = None
+    entity_overrides: dict[str, str] = field(default_factory=dict)
+    learned_memory: dict = field(default_factory=default_user_memory)
 
 
 class SettingsStore:
@@ -144,6 +160,7 @@ class SettingsStore:
             "recent_output_dirs": [],
             "write_mvp": True,
             "delete_zero_balance_rows": True,
+            "learned_memory": default_user_memory(),
         }
 
     def _load(self) -> dict:
@@ -159,6 +176,8 @@ class SettingsStore:
             value = raw.get(key, default)
             if isinstance(default, list) and isinstance(value, list):
                 data[key] = [str(item) for item in value if str(item).strip()]
+            elif isinstance(default, dict) and isinstance(value, dict):
+                data[key] = sanitize_user_memory(value) if key == "learned_memory" else dict(value)
             elif isinstance(default, str):
                 data[key] = str(value)
             elif isinstance(default, bool):
@@ -204,6 +223,13 @@ class SettingsStore:
 
     def delete_zero_balance_rows_default(self) -> bool:
         return bool(self.data.get("delete_zero_balance_rows", True))
+
+    def learned_memory(self) -> dict:
+        return sanitize_user_memory(self.data.get("learned_memory", default_user_memory()))
+
+    def update_learned_memory(self, memory: dict) -> None:
+        self.data["learned_memory"] = sanitize_user_memory(memory)
+        self.save()
 
 
 class DropPathCard(QFrame):
@@ -265,7 +291,7 @@ class DropPathCard(QFrame):
         self.browse_button.clicked.connect(self._browse)
         input_row.addWidget(self.browse_button)
 
-        self.status_label = QLabel("Drop a path here or choose one from the list.", self)
+        self.status_label = QLabel("Drop files here or browse to choose them.", self)
         self.status_label.setObjectName("FieldStatus")
         self.status_label.setProperty("tone", "idle")
         self.status_label.setWordWrap(True)
@@ -365,6 +391,68 @@ class DropPathCard(QFrame):
         event.ignore()
 
 
+class EntityResolutionDialog(QDialog):
+    def __init__(self, items: list[PreflightItem], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._boxes: dict[str, QComboBox] = {}
+        self.setWindowTitle("Confirm Company Names")
+        self.setModal(True)
+        self.resize(760, 260)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        intro = QLabel(
+            "A few files need a quick company-name check before the build starts. Confirm the suggested name or type the correct one.",
+            self,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        for item in items:
+            frame = QFrame(self)
+            frame.setObjectName("PathCard")
+            frame_layout = QVBoxLayout(frame)
+            frame_layout.setContentsMargins(0, 10, 0, 10)
+            frame_layout.setSpacing(6)
+
+            title = QLabel(item.path.name, frame)
+            title.setObjectName("FieldTitle")
+            frame_layout.addWidget(title)
+
+            detail = QLabel(
+                f"Detected layout: {item.parser_name} on sheet {item.sheet_name}. {item.note}",
+                frame,
+            )
+            detail.setObjectName("FieldBody")
+            detail.setWordWrap(True)
+            frame_layout.addWidget(detail)
+
+            combo = QComboBox(frame)
+            combo.setObjectName("PathCombo")
+            combo.setEditable(True)
+            combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            combo.addItems(list(item.entity_options))
+            combo.setCurrentText(item.suggested_entity)
+            frame_layout.addWidget(combo)
+
+            self._boxes[str(item.path)] = combo
+            layout.addWidget(frame)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selections(self) -> dict[str, str]:
+        return {
+            path: box.currentText().strip()
+            for path, box in self._boxes.items()
+            if box.currentText().strip()
+        }
+
+
 class ReconcileWorker(QObject):
     progress = Signal(int, str)
     log = Signal(str)
@@ -388,28 +476,30 @@ class ReconcileWorker(QObject):
             self.log.emit(message)
 
         try:
-            advance("Preparing output folder...")
+            advance("Getting the output folder ready...")
             self.cfg.out_dir.mkdir(parents=True, exist_ok=True)
             out_import = self.cfg.out_dir / "tb_to_import_updated.xlsx"
             out_details = self.cfg.out_dir / "tb_build_details.xlsx"
             out_review = self.cfg.out_dir / "tb_review_style.xlsx"
 
-            advance("Reading workbook data...")
+            advance("Reading the Excel files...")
             result = build_from_workbooks(
                 current_specs=self.cfg.client_specs,
                 prior_specs=self.cfg.prior_specs,
+                entity_overrides=self.cfg.entity_overrides,
+                client_config=self.cfg.client_config,
                 keep_zero_rows=not self.cfg.delete_zero_balance_rows,
             )
-            advance("Writing import-ready workbook...")
+            advance("Creating the final import workbook...")
             write_import_workbook(result.updated_import, out_import)
 
             if self.cfg.write_mvp:
-                advance("Writing audit details workbook...")
+                advance("Creating the audit details workbook...")
                 write_details_workbook(result, out_details)
-                advance("Writing review-style workbook...")
+                advance("Creating the review workbook...")
                 write_review_workbook(result.updated_import, out_review, "Review Trial Balance")
 
-            advance("Applying final workbook formatting...")
+            advance("Finishing and formatting the workbook files...")
             format_outputs(
                 out_import,
                 out_details if self.cfg.write_mvp else None,
@@ -430,13 +520,14 @@ class ReconcileWorker(QObject):
                 "output_rows": int(summary_map.get("output row count", len(result.updated_import))),
                 "current_total": float(summary_map.get("output current-year total", float(result.updated_import["cy_balance"].sum()))),
             }
-            self.progress.emit(100, "Completed.")
-            self.log.emit("Completed successfully.")
+            self.progress.emit(100, "Build complete.")
+            self.log.emit("Build completed successfully.")
+            learned_memory = remember_successful_workbooks(self.cfg.learned_memory, result.current_trial_balance)
             self.success.emit(
                 {
                     "headline": (
-                        f"Run complete. {counts['output_rows']} rows are ready for import, with "
-                        f"{counts['matched']} matched to prior year, {counts['new_rows']} new, "
+                        f"Build complete. {counts['output_rows']} rows are in the final import file, with "
+                        f"{counts['matched']} matched to last year, {counts['new_rows']} new, "
                         f"{counts['carryforward']} carried forward, {counts['renumbered']} renumbered, "
                         f"and {counts['review_queue']} waiting for review. Confidence levels: "
                         f"{counts['high_confidence']} high, {counts['medium_confidence']} medium, "
@@ -444,6 +535,7 @@ class ReconcileWorker(QObject):
                     ),
                     "ready_for_import": bool(result.ready_for_import),
                     "used_prior_comparison": bool(counts["prior_rows"]),
+                    "learned_memory": learned_memory,
                     "counts": counts,
                     "outputs": {
                         "import": str(out_import),
@@ -455,8 +547,8 @@ class ReconcileWorker(QObject):
             )
         except PermissionError as exc:
             self.error.emit(
-                "Permission denied while writing an output workbook.\n"
-                "Close any open Excel copies of tb_to_import_updated.xlsx, tb_build_details.xlsx, or tb_review_style.xlsx, then run again.\n\n"
+                "The program could not save one of the output files.\n"
+                "Close any open Excel copies of tb_to_import_updated.xlsx, tb_build_details.xlsx, or tb_review_style.xlsx, then try again.\n\n"
                 f"Details: {exc}"
             )
         except Exception as exc:  # noqa: BLE001
@@ -510,7 +602,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(title)
 
         subtitle = QLabel(
-            "Choose the current-year files, optional prior-year official TB files, and an output folder. The program builds a fresh trial balance, compares it to last year when those official TB workbooks are provided, and adds confidence highlighting plus an audit trail workbook.",
+            "Add the current-year client files, optional prior-year official TB files, and an output folder. The program builds the new trial balance, compares it to last year when those official TB workbooks are included, and can also create review files for you.",
             content,
         )
         subtitle.setObjectName("PageSubtitle")
@@ -534,13 +626,13 @@ class MainWindow(QMainWindow):
         side_layout.setSpacing(18)
         workspace.addWidget(side_frame, 1)
 
-        files_title = QLabel("Files", content)
+        files_title = QLabel("What You Need", content)
         files_title.setObjectName("SectionTitle")
         main_column.addWidget(files_title)
 
         self.client_card = DropPathCard(
-            "Client trial balance file(s)",
-            "Choose the current-year trial balance files you received from the client. If the job should be combined into one final TB, add every current-year file here.",
+            "Current-year client TB file(s)",
+            "Choose the trial balance files you received from the client for this year. If several files should be combined into one final TB, add them all here.",
             "C:\\path\\to\\client tb.xlsx | C:\\path\\to\\ORE TB.xlsx",
             "Browse",
             "file",
@@ -552,8 +644,8 @@ class MainWindow(QMainWindow):
         main_column.addWidget(self.client_card)
 
         self.import_card = DropPathCard(
-            "Prior-year official TB file(s) (Optional)",
-            "Choose the previous year's official trial balance workbook(s) that the new trial balance should line up against. Do not use last year's TB import workbook here.",
+            "Prior-year official TB file(s) (optional)",
+            "Choose last year's official trial balance workbook(s) so this year's build can line up against them. Do not use last year's TB import workbook here.",
             "C:\\path\\to\\2022 Trial Balance.xlsx | C:\\path\\to\\HR 2022 Trial Balance.xlsx",
             "Browse",
             "file",
@@ -565,7 +657,7 @@ class MainWindow(QMainWindow):
         main_column.addWidget(self.import_card)
 
         prior_note = QLabel(
-            "Leave the prior-year field blank if you only want to build from the current-year files. The run will still finish, but unmatched rows will stay flagged for review.",
+            "You can leave the prior-year field blank. The build will still run, but anything the program cannot confidently line up will stay marked for review.",
             content,
         )
         prior_note.setObjectName("SectionBody")
@@ -575,7 +667,7 @@ class MainWindow(QMainWindow):
 
         self.out_dir_card = DropPathCard(
             "Output folder",
-            "Drop a folder here, reuse a recent destination, or type a new one to create it on the next run.",
+            "Choose where the finished files should be saved. You can pick an existing folder or type a new one to create during the build.",
             "C:\\path\\to\\output folder",
             "Browse",
             "directory",
@@ -584,16 +676,16 @@ class MainWindow(QMainWindow):
         self.out_dir_card.pathChanged.connect(self._validate_form)
         main_column.addWidget(self.out_dir_card)
 
-        options_title = QLabel("Options", side_frame)
+        options_title = QLabel("Build Options", side_frame)
         options_title.setObjectName("SectionTitle")
         side_layout.addWidget(options_title)
 
-        self.mvp_checkbox = QCheckBox("Create audit details workbook", side_frame)
+        self.mvp_checkbox = QCheckBox("Also create audit details workbook", side_frame)
         self.mvp_checkbox.setObjectName("Toggle")
         self.mvp_checkbox.toggled.connect(self._update_output_hint)
         side_layout.addWidget(self.mvp_checkbox)
 
-        self.zero_rows_checkbox = QCheckBox("Remove zero-balance rows from final file", side_frame)
+        self.zero_rows_checkbox = QCheckBox("Leave zero-balance rows out of final import file", side_frame)
         self.zero_rows_checkbox.setObjectName("Toggle")
         self.zero_rows_checkbox.toggled.connect(self._update_output_hint)
         side_layout.addWidget(self.zero_rows_checkbox)
@@ -606,17 +698,23 @@ class MainWindow(QMainWindow):
         self.output_hint_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         side_layout.addWidget(self.output_hint_label)
 
-        run_title = QLabel("Run", side_frame)
+        run_title = QLabel("Build", side_frame)
         run_title.setObjectName("SectionTitle")
         side_layout.addWidget(run_title)
 
-        self.run_button = QPushButton("Build Trial Balance", side_frame)
+        self.run_button = QPushButton("Build Output Files", side_frame)
         self.run_button.setObjectName("PrimaryButton")
         self.run_button.setMinimumHeight(56)
         self.run_button.setMinimumWidth(220)
         self.run_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.run_button.clicked.connect(self._start_run)
         side_layout.addWidget(self.run_button)
+
+        self.guide_button = QPushButton("Open Simple User Guide", side_frame)
+        self.guide_button.setObjectName("SecondaryButton")
+        self.guide_button.setMinimumHeight(46)
+        self.guide_button.clicked.connect(self._open_user_guide)
+        side_layout.addWidget(self.guide_button)
 
         self.open_output_button = QPushButton("Open Output Folder", side_frame)
         self.open_output_button.setObjectName("SecondaryButton")
@@ -631,12 +729,12 @@ class MainWindow(QMainWindow):
         self.quit_button.clicked.connect(self.close)
         side_layout.addWidget(self.quit_button)
 
-        summary_title = QLabel("Last Run", side_frame)
+        summary_title = QLabel("Latest Run", side_frame)
         summary_title.setObjectName("SectionTitle")
         side_layout.addWidget(summary_title)
 
         self.summary_caption = QLabel(
-            "Run the workflow to see a simple summary of matched, new, carryforward, and renumbered rows.",
+            "Run the build to see a simple summary of what matched, what was new, and what still needs review.",
             side_frame,
         )
         self.summary_caption.setObjectName("SummaryCaption")
@@ -645,7 +743,7 @@ class MainWindow(QMainWindow):
         self.summary_caption.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         side_layout.addWidget(self.summary_caption)
 
-        self.outputs_label = QLabel("Output files will appear here after a successful run.", side_frame)
+        self.outputs_label = QLabel("Your output files will appear here after a successful build.", side_frame)
         self.outputs_label.setObjectName("OutputsLabel")
         self.outputs_label.setWordWrap(True)
         self.outputs_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
@@ -664,7 +762,7 @@ class MainWindow(QMainWindow):
         progress_title.setObjectName("SectionTitle")
         bottom_layout.addWidget(progress_title)
 
-        self.status_banner = QLabel("Complete the current-year workbook inputs and output folder to enable reconciliation.", bottom_frame)
+        self.status_banner = QLabel("Add the current-year files and choose an output folder to get started.", bottom_frame)
         self.status_banner.setObjectName("StatusBanner")
         self.status_banner.setProperty("tone", "ready")
         self.status_banner.setWordWrap(True)
@@ -688,7 +786,7 @@ class MainWindow(QMainWindow):
         self.log_panel.setMinimumHeight(220)
         bottom_layout.addWidget(self.log_panel)
 
-        self._append_log("Application ready. Waiting for input files.")
+        self._append_log("Program ready. Waiting for files.")
 
     def _load_settings(self) -> None:
         client_recent = self.settings_store.recent("recent_client_files")
@@ -705,28 +803,127 @@ class MainWindow(QMainWindow):
         self.mvp_checkbox.setChecked(self.settings_store.write_mvp_default())
         self.zero_rows_checkbox.setChecked(self.settings_store.delete_zero_balance_rows_default())
 
+    def _build_memory_client_config(self) -> ClientConfig | None:
+        return build_memory_client_config(self.settings_store.learned_memory())
+
+    def _known_memory_entities(self) -> list[str]:
+        return known_entities_from_memory(self.settings_store.learned_memory())
+
+    def _confirm_ambiguous_entities(self, items: list[PreflightItem]) -> tuple[bool, dict[str, str]]:
+        prompts = [item for item in items if item.needs_entity_confirmation]
+        if not prompts:
+            return True, {}
+
+        dialog = EntityResolutionDialog(prompts, self)
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            self.status_banner.setProperty("tone", "ready")
+            self.status_banner.setText("Build paused so you can confirm the company names first.")
+            repolish(self.status_banner)
+            self._append_log("Build paused while company names were waiting for confirmation.")
+            return False, {}
+
+        selections = dialog.selections()
+        overrides: dict[str, str] = {}
+        for item in prompts:
+            chosen = selections.get(str(item.path), "").strip()
+            if not chosen:
+                self.status_banner.setProperty("tone", "error")
+                self.status_banner.setText(f"Choose a company name for {item.path.name} before building.")
+                repolish(self.status_banner)
+                self._append_log(f"Build paused because {item.path.name} still needs a company name.")
+                return False, {}
+            for key in (str(item.path).lower(), item.path.name.lower(), item.path.stem.lower()):
+                overrides[key] = chosen
+        return True, overrides
+
+    def _prepare_run_config(self) -> tuple[RunConfig | None, list[PreflightItem], str | None]:
+        client_specs = [
+            WorkbookSpec(path=Path(text).expanduser())
+            for text in self.client_card.path_texts()
+        ]
+        prior_specs = [
+            WorkbookSpec(path=Path(text).expanduser())
+            for text in self.import_card.path_texts()
+        ]
+
+        learned_memory = self.settings_store.learned_memory()
+        memory_config = self._build_memory_client_config()
+        memory_entities = self._known_memory_entities()
+        prior_entities: list[str] = []
+
+        if prior_specs:
+            try:
+                prior_df = read_prior_workbooks(prior_specs, client_config=memory_config)
+            except Exception as exc:  # noqa: BLE001
+                return None, [], f"Could not read the prior-year official TB workbook(s): {exc}"
+            prior_entities = [
+                entity
+                for entity in prior_df["entity"].astype(str).unique().tolist()
+                if str(entity).strip()
+            ]
+
+        known_entities: list[str] = []
+        for value in [*prior_entities, *memory_entities]:
+            text = str(value).strip()
+            if text and text not in known_entities:
+                known_entities.append(text)
+
+        try:
+            previews = preview_current_workbooks(
+                client_specs,
+                known_entities=known_entities,
+                client_config=memory_config,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return None, [], f"Could not read the current-year workbook(s): {exc}"
+
+        preflight_items = build_preflight_items(
+            previews,
+            known_entities=known_entities,
+            prior_entities=prior_entities,
+            memory_entities=memory_entities,
+        )
+        ok, overrides = self._confirm_ambiguous_entities(preflight_items)
+        if not ok:
+            return None, preflight_items, None
+
+        return (
+            RunConfig(
+                client_specs=client_specs,
+                prior_specs=prior_specs,
+                out_dir=Path(self.out_dir_card.path_text()).expanduser(),
+                write_mvp=self.mvp_checkbox.isChecked(),
+                delete_zero_balance_rows=self.zero_rows_checkbox.isChecked(),
+                client_config=memory_config,
+                entity_overrides=overrides,
+                learned_memory=learned_memory,
+            ),
+            preflight_items,
+            None,
+        )
+
     def _update_output_hint(self, *_args) -> None:
         zero_row_policy = (
-            "Zero-balance rows: deleted from the final import workbook"
+            "Zero-balance rows: left out of the final import workbook"
             if self.zero_rows_checkbox.isChecked()
             else "Zero-balance rows: kept in the final import workbook"
         )
         if self.mvp_checkbox.isChecked():
             self.output_hint_label.setText(
-                "Creates:\n"
+                "This build creates:\n"
                 "tb_to_import_updated.xlsx\n"
                 "tb_build_details.xlsx\n"
                 "tb_review_style.xlsx\n"
-                "Confidence colors: green/high, yellow/medium, red/low\n"
-                "Single combined TB output hides the entity column automatically\n"
+                "Confidence colors: green = high, yellow = medium, red = low\n"
+                "Combined jobs hide the entity column automatically in the final import file\n"
                 f"{zero_row_policy}"
             )
         else:
             self.output_hint_label.setText(
-                "Creates:\n"
+                "This build creates:\n"
                 "tb_to_import_updated.xlsx\n"
-                "Audit details and review workbooks skipped\n"
-                "Single combined TB output hides the entity column automatically\n"
+                "Audit details and review workbooks are skipped\n"
+                "Combined jobs hide the entity column automatically in the final import file\n"
                 f"{zero_row_policy}"
             )
 
@@ -742,7 +939,7 @@ class MainWindow(QMainWindow):
         valid_paths: list[Path] = []
         for path in prior_paths:
             if not path.exists():
-                self.import_card.set_status("error", f"Prior-year trial balance file was not found: {path}")
+                self.import_card.set_status("error", f"Prior-year official TB file was not found: {path}")
                 return False, []
             if not path.is_file():
                 self.import_card.set_status("error", "Each prior-year path must point to an Excel workbook.")
@@ -760,16 +957,16 @@ class MainWindow(QMainWindow):
     def _validate_client_inputs(self) -> tuple[bool, list[Path]]:
         raw_paths = [Path(text).expanduser() for text in self.client_card.path_texts()]
         if not raw_paths:
-            self.client_card.set_status("idle", "Drop or browse one or more client trial balance files.")
+            self.client_card.set_status("idle", "Add one or more current-year client TB files.")
             return False, []
 
         valid_paths: list[Path] = []
         for path in raw_paths:
             if not path.exists():
-                self.client_card.set_status("error", f"Client trial balance file was not found: {path}")
+                self.client_card.set_status("error", f"Current-year client TB file was not found: {path}")
                 return False, []
             if not path.is_file():
-                self.client_card.set_status("error", "Each client trial balance path must point to an Excel workbook.")
+                self.client_card.set_status("error", "Each current-year path must point to an Excel workbook.")
                 return False, []
             if path.suffix.lower() not in EXCEL_SUFFIXES:
                 self.client_card.set_status("error", "Use Excel files with .xlsx, .xlsm, or .xls extensions.")
@@ -778,13 +975,13 @@ class MainWindow(QMainWindow):
 
         workbook_count = len(valid_paths)
         noun = "file" if workbook_count == 1 else "files"
-        self.client_card.set_status("ok", f"{workbook_count} client trial balance {noun} ready.")
+        self.client_card.set_status("ok", f"{workbook_count} current-year client TB {noun} ready.")
         return True, valid_paths
 
     def _validate_output_dir(self) -> tuple[bool, Path | None]:
         text = self.out_dir_card.path_text()
         if not text:
-            self.out_dir_card.set_status("idle", "Choose or type the folder where outputs should be written.")
+            self.out_dir_card.set_status("idle", "Choose or type the folder where the finished files should be saved.")
             return False, None
 
         path = Path(text).expanduser()
@@ -792,15 +989,15 @@ class MainWindow(QMainWindow):
             if not path.is_dir():
                 self.out_dir_card.set_status("error", "Output path must be a folder, not a file.")
                 return False, None
-            self.out_dir_card.set_status("ok", "Output files will be written into this folder.")
+            self.out_dir_card.set_status("ok", "Finished files will be saved in this folder.")
             return True, path
 
         parent = path.parent if str(path.parent) else Path.cwd()
         if parent.exists() and parent.is_dir():
-            self.out_dir_card.set_status("warning", "This folder does not exist yet. It will be created on run.")
+            self.out_dir_card.set_status("warning", "This folder does not exist yet. The program will create it during the build.")
             return True, path
 
-        self.out_dir_card.set_status("error", "Output folder cannot be created because its parent path is missing.")
+        self.out_dir_card.set_status("error", "This output folder cannot be created because its parent folder is missing.")
         return False, None
 
     def _validate_form(self, *_args, update_banner: bool = True) -> bool:
@@ -828,35 +1025,18 @@ class MainWindow(QMainWindow):
         if update_banner:
             if self.busy:
                 tone = "ready"
-                message = "Reconciliation is running. Follow the progress log below."
+                message = "Build in progress. You can follow each step in the progress log below."
             elif valid:
                 tone = "good"
-                message = "Everything looks ready. Start the build whenever you are ready."
+                message = "Everything looks ready. Click Build Output Files when you are ready."
             else:
                 tone = "ready"
-                message = "Complete the current-year workbook inputs and output folder to enable reconciliation."
+                message = "Add the current-year files and choose an output folder to get started."
 
             self.status_banner.setProperty("tone", tone)
             self.status_banner.setText(message)
             repolish(self.status_banner)
         return valid
-
-    def _build_run_config(self) -> RunConfig:
-        client_specs = [
-            WorkbookSpec(path=Path(text).expanduser())
-            for text in self.client_card.path_texts()
-        ]
-        prior_specs = [
-            WorkbookSpec(path=Path(text).expanduser())
-            for text in self.import_card.path_texts()
-        ]
-        return RunConfig(
-            client_specs=client_specs,
-            prior_specs=prior_specs,
-            out_dir=Path(self.out_dir_card.path_text()).expanduser(),
-            write_mvp=self.mvp_checkbox.isChecked(),
-            delete_zero_balance_rows=self.zero_rows_checkbox.isChecked(),
-        )
 
     def _set_busy(self, busy: bool, preserve_banner: bool = False) -> None:
         self.busy = busy
@@ -872,14 +1052,34 @@ class MainWindow(QMainWindow):
 
     def _start_run(self, *_args) -> None:
         if not self._validate_form():
-            self._append_log("Run blocked because at least one input is not valid.")
+            self._append_log("Build blocked because at least one input still needs attention.")
             return
 
-        cfg = self._build_run_config()
+        cfg, preflight_items, preflight_error = self._prepare_run_config()
+        if preflight_error:
+            self.status_banner.setProperty("tone", "error")
+            self.status_banner.setText(preflight_error)
+            repolish(self.status_banner)
+            self._append_log(preflight_error)
+            return
+        if cfg is None:
+            return
+
         self.settings_store.remember_run_config(cfg)
         self._refresh_recent_lists()
 
-        self._append_log("Starting trial-balance build.")
+        memory_rules = build_memory_client_config(cfg.learned_memory)
+        if memory_rules is not None:
+            self._append_log("Using saved client memory from earlier runs to reuse workbook names, layouts, and sheet choices.")
+        for item in preflight_items:
+            if item.note and not item.needs_entity_confirmation:
+                self._append_log(f"{item.path.name}: {item.note}")
+        if cfg.entity_overrides:
+            confirmed = sorted({value for value in cfg.entity_overrides.values() if value})
+            if confirmed:
+                self._append_log(f"Confirmed company names for this build: {', '.join(confirmed)}")
+
+        self._append_log("Starting build.")
         self._set_busy(True)
         self.progress_bar.setValue(0)
         self.open_output_button.setEnabled(False)
@@ -911,6 +1111,13 @@ class MainWindow(QMainWindow):
         outputs = payload["outputs"]
         ready_for_import = bool(payload.get("ready_for_import", True))
         used_prior_comparison = bool(payload.get("used_prior_comparison", False))
+        learned_memory = payload.get("learned_memory")
+        if isinstance(learned_memory, dict):
+            before_count = len(self.settings_store.learned_memory().get("workbook_rules", {}))
+            self.settings_store.update_learned_memory(learned_memory)
+            after_count = len(self.settings_store.learned_memory().get("workbook_rules", {}))
+            if after_count > before_count:
+                self._append_log("Saved workbook names and company matches from this build for future jobs.")
 
         self.summary_caption.setText(
             "Import-ready rows: "
@@ -959,19 +1166,19 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(100)
         self.status_banner.setProperty("tone", "good" if ready_for_import else "ready")
         if ready_for_import and used_prior_comparison:
-            message = "Reconciliation finished successfully."
+            message = "Build finished successfully. The files are ready."
         elif ready_for_import:
-            message = "Build finished successfully from the current-year files."
+            message = "Build finished successfully using the current-year files."
         else:
-            message = "Run completed, but the review queue still needs manual attention before import."
+            message = "Build finished, but the review queue still needs manual attention before import."
         self.status_banner.setText(message)
         repolish(self.status_banner)
 
     def _on_worker_error(self, message: str) -> None:
         self.status_banner.setProperty("tone", "error")
-        self.status_banner.setText("The run stopped before completion. Review the log for details.")
+        self.status_banner.setText("The build stopped before it finished. Review the log for details.")
         repolish(self.status_banner)
-        self._append_log("Run failed.")
+        self._append_log("Build failed.")
         for line in message.splitlines():
             self._append_log(line)
 
@@ -988,6 +1195,15 @@ class MainWindow(QMainWindow):
     def _open_output_folder(self, *_args) -> None:
         if self.latest_output_dir is not None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.latest_output_dir)))
+
+    def _open_user_guide(self, *_args) -> None:
+        if USER_GUIDE_PATH.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(USER_GUIDE_PATH)))
+            return
+        self.status_banner.setProperty("tone", "error")
+        self.status_banner.setText("The user guide PDF could not be found.")
+        repolish(self.status_banner)
+        self._append_log(f"User guide PDF missing: {USER_GUIDE_PATH}")
 
     def _open_link(self, url: str) -> None:
         QDesktopServices.openUrl(QUrl(url))

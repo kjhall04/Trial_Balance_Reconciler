@@ -164,6 +164,38 @@ def _best_global_candidate(current_row: pd.Series, prior_df: pd.DataFrame) -> Ma
     return None
 
 
+def _same_entity_number_candidate(current_row: pd.Series, prior_df: pd.DataFrame) -> MatchCandidate | None:
+    raw_number = standard_account_number(current_row.get("raw_account_number"))
+    if not raw_number:
+        return None
+
+    entity_matches = prior_df[
+        (prior_df["acct_no"] == raw_number)
+        & (prior_df["entity"].map(normalize_match_text) == normalize_match_text(current_row["entity"]))
+    ]
+    if entity_matches.empty:
+        return None
+
+    best_row = None
+    best_score = -1.0
+    for _, prior_row in entity_matches.iterrows():
+        score = _candidate_score(current_row, prior_row)
+        if score > best_score:
+            best_row = prior_row
+            best_score = score
+    if best_row is None:
+        return None
+
+    return MatchCandidate(
+        prior_row=int(best_row["prior_row"]),
+        score=max(best_score, 0.9),
+        account=str(best_row["account"]),
+        acct_no=str(best_row["acct_no"]),
+        family=account_family(best_row["acct_no"]),
+        leadsheet=str(best_row["class"]),
+    )
+
+
 def _infer_class(
     name: str,
     family: str,
@@ -497,7 +529,8 @@ def build_trial_balance(
             )
             continue
 
-        global_candidate = _best_global_candidate(current_row, prior_working)
+        exact_number_candidate = _same_entity_number_candidate(current_row, prior_working)
+        global_candidate = exact_number_candidate or _best_global_candidate(current_row, prior_working)
         global_prior_row = (
             prior_working.loc[prior_working["prior_row"] == global_candidate.prior_row].iloc[0]
             if global_candidate is not None
@@ -511,16 +544,22 @@ def build_trial_balance(
             prefix3_to_class,
             prefix2_to_class,
         )
-        leadsheet = (
-            inferred_class
-            if inferred_class and (not global_candidate or global_candidate.score < 0.9)
-            else (global_candidate.leadsheet if global_candidate and global_candidate.score >= 0.72 else inferred_class)
-        )
-        account_name = _preferred_account_name(current_row, global_candidate)
+        if exact_number_candidate is not None:
+            leadsheet = exact_number_candidate.leadsheet
+            account_name = exact_number_candidate.account
+        else:
+            leadsheet = (
+                inferred_class
+                if inferred_class and (not global_candidate or global_candidate.score < 0.9)
+                else (global_candidate.leadsheet if global_candidate and global_candidate.score >= 0.72 else inferred_class)
+            )
+            account_name = _preferred_account_name(current_row, global_candidate)
         priority, is_rollup, can_displace = _current_priority(current_row, global_candidate)
 
         desired_acct_no = ""
-        if global_candidate and global_candidate.score >= 0.9:
+        if exact_number_candidate is not None:
+            desired_acct_no = exact_number_candidate.acct_no
+        elif global_candidate and global_candidate.score >= 0.9:
             desired_acct_no = global_candidate.acct_no
         else:
             raw_number = standard_account_number(current_row["raw_account_number"])
@@ -535,7 +574,9 @@ def build_trial_balance(
             desired_acct_no=desired_acct_no,
             has_global_candidate=global_candidate is not None,
         )
-        if global_candidate and global_candidate.score >= 0.98:
+        if exact_number_candidate is not None:
+            decision_note = "Reused the prior-year leadsheet and account name because this entity already used the same account number."
+        elif global_candidate and global_candidate.score >= 0.98:
             decision_note = "Very strong prior-year similarity guided the leadsheet and account number."
         elif global_candidate and global_candidate.score >= 0.72:
             decision_note = "A similar prior-year account guided the leadsheet and account number."
@@ -632,6 +673,36 @@ def build_trial_balance(
                 "prior_row": int(prior_row["prior_row"]),
                 "raw_account_text": "",
                 "raw_account_number": prior_row["acct_no"],
+                "match_score": 1.0,
+                "confidence_level": confidence_level,
+                "confidence_score": confidence_score,
+                "confidence_reason": confidence_reason,
+                "decision_note": "No current-year row matched, so the prior-year line was carried forward.",
+                "was_renumbered": False,
+                **_current_source_metadata(pd.Series(dtype=object)),
+                **_prior_source_metadata(prior_row),
+            }
+        )
+        candidate_rows.append(
+            {
+                "row_type": "carryforward",
+                "source_kind": "carryforward_prior_year",
+                "status": "carried forward from prior year",
+                "entity": prior_row["entity"],
+                "class": prior_row["class"],
+                "account": prior_row["account"],
+                "py_balance": float(prior_row["py_balance"]),
+                "cy_balance": 0.0,
+                "desired_acct_no": prior_row["acct_no"],
+                "family": prior_row["family"],
+                "current_row": None,
+                "prior_row": int(prior_row["prior_row"]),
+                "raw_account_text": "",
+                "raw_account_number": prior_row["acct_no"],
+                "path_depth": 0,
+                "priority": 90,
+                "can_displace": False,
+                "prefers_base": False,
                 "match_score": 1.0,
                 "confidence_level": confidence_level,
                 "confidence_score": confidence_score,
@@ -1006,14 +1077,13 @@ def build_trial_balance(
         carryforward_audit_df = carryforward_audit_df.reindex(columns=comparison_columns, fill_value="")
     if not review_queue_df.empty:
         review_queue_df = review_queue_df.reindex(columns=comparison_columns, fill_value="")
-    comparison_df = (
-        pd.concat(
-            [frame for frame in (assigned_audit_df, carryforward_audit_df, review_queue_df) if not frame.empty],
-            ignore_index=True,
-        )
-        if (not assigned_audit_df.empty or not carryforward_audit_df.empty or not review_queue_df.empty)
-        else assigned_audit_df.copy()
-    )
+    comparison_frames = [frame for frame in (assigned_audit_df, carryforward_audit_df, review_queue_df) if not frame.empty]
+    if not comparison_frames:
+        comparison_df = assigned_audit_df.copy()
+    elif len(comparison_frames) == 1:
+        comparison_df = comparison_frames[0].copy()
+    else:
+        comparison_df = pd.concat(comparison_frames, ignore_index=True)
 
     confidence_counts = output_df["confidence_level"].value_counts()
 
