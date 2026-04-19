@@ -17,7 +17,7 @@ CONFIDENCE_FONT_COLORS = {
     "medium": "B8860B",
     "low": "C62828",
 }
-ACCOUNTING_NUMBER_FORMAT = '#,##0.00;(#,##0.00);-'
+ACCOUNTING_NUMBER_FORMAT = '#,##0.00;(#,##0.00);"-";@'
 DETAIL_BALANCE_HEADERS = {"py_balance", "cy_balance"}
 REVIEW_BALANCE_HEADERS = {"previous year rep", "current year prelim", "ajes", "final"}
 

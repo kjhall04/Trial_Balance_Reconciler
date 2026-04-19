@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+from openpyxl import load_workbook
 
 from trial_balance_pipeline import WorkbookSpec, build_from_workbooks, load_client_config
+from trial_balance_pipeline.reporting import ACCOUNTING_NUMBER_FORMAT, format_outputs, write_import_workbook
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -66,3 +68,43 @@ def test_sample_build_stays_close_to_reference_import() -> None:
     shared = len(actual_keys & expected_keys)
 
     assert shared >= 539
+
+
+def test_import_workbook_uses_accounting_style_for_zero_and_negative_balances() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "entity": "Demo Co",
+                "class": "1000",
+                "acct_no": "1001",
+                "account": "Cash",
+                "py_balance": 125.0,
+                "cy_balance": 0.0,
+            },
+            {
+                "entity": "Demo Co",
+                "class": "2000",
+                "acct_no": "2001",
+                "account": "Payables",
+                "py_balance": -250.5,
+                "cy_balance": 300.0,
+            },
+        ]
+    )
+    out_path = BASE_DIR / "tmp_formatted_import.xlsx"
+    try:
+        write_import_workbook(df, out_path)
+        format_outputs(out_path, None)
+
+        sheet = load_workbook(out_path).active
+
+        assert sheet["D1"].value == 125.0
+        assert sheet["E1"].value == 0.0
+        assert sheet["D2"].value == -250.5
+        assert sheet["E2"].value == 300.0
+        assert sheet["D1"].number_format == ACCOUNTING_NUMBER_FORMAT
+        assert sheet["E1"].number_format == ACCOUNTING_NUMBER_FORMAT
+        assert sheet["D2"].number_format == ACCOUNTING_NUMBER_FORMAT
+        assert sheet["E2"].number_format == ACCOUNTING_NUMBER_FORMAT
+    finally:
+        out_path.unlink(missing_ok=True)
