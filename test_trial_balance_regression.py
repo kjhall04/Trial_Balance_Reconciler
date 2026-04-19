@@ -26,7 +26,7 @@ def _sample_prior_specs() -> list[WorkbookSpec]:
 
 
 def test_sample_build_keeps_carryforward_rows_in_final_import() -> None:
-    cfg = load_client_config(BASE_DIR / "docs" / "example_client_config.json")
+    cfg = load_client_config(BASE_DIR / "docs" / "client_config_template.json")
     result = build_from_workbooks(
         current_specs=_sample_current_specs(),
         prior_specs=_sample_prior_specs(),
@@ -45,7 +45,7 @@ def test_sample_build_keeps_carryforward_rows_in_final_import() -> None:
 
 
 def test_sample_build_stays_close_to_reference_import() -> None:
-    cfg = load_client_config(BASE_DIR / "docs" / "example_client_config.json")
+    cfg = load_client_config(BASE_DIR / "docs" / "client_config_template.json")
     result = build_from_workbooks(
         current_specs=_sample_current_specs(),
         prior_specs=_sample_prior_specs(),

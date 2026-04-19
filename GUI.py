@@ -146,12 +146,15 @@ class RunConfig:
 class SettingsStore:
     def __init__(self) -> None:
         self.path = self._state_file_path()
-        self.fallback_path = Path.cwd() / STATE_FILE_NAME
+        self.legacy_path = self._legacy_state_file_path()
         self.data = self._load()
 
     def _state_file_path(self) -> Path:
+        return Path.cwd() / STATE_FILE_NAME
+
+    def _legacy_state_file_path(self) -> Path | None:
         base_dir = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
-        return Path(base_dir) / STATE_FILE_NAME if base_dir else Path.cwd() / STATE_FILE_NAME
+        return Path(base_dir) / STATE_FILE_NAME if base_dir else None
 
     def _default_data(self) -> dict:
         return {
@@ -164,7 +167,11 @@ class SettingsStore:
         }
 
     def _load(self) -> dict:
-        load_path = self.path if self.path.exists() else self.fallback_path
+        load_path = self.path
+        migrate_from_legacy = False
+        if not load_path.exists() and self.legacy_path and self.legacy_path.exists():
+            load_path = self.legacy_path
+            migrate_from_legacy = True
         if not load_path.exists():
             return self._default_data()
         try:
@@ -182,18 +189,18 @@ class SettingsStore:
                 data[key] = str(value)
             elif isinstance(default, bool):
                 data[key] = bool(value)
+        if migrate_from_legacy:
+            self.data = data
+            self.save()
         return data
 
     def save(self) -> None:
         payload = json.dumps(self.data, indent=2)
-        for candidate in (self.path, self.fallback_path):
-            try:
-                candidate.parent.mkdir(parents=True, exist_ok=True)
-                candidate.write_text(payload, encoding="utf-8")
-                self.path = candidate
-                return
-            except OSError:
-                continue
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(payload, encoding="utf-8")
+        except OSError:
+            return
 
     def recent(self, key: str) -> list[str]:
         values = self.data.get(key, [])
@@ -209,10 +216,6 @@ class SettingsStore:
         self.save()
 
     def remember_run_config(self, cfg: RunConfig) -> None:
-        joined_client_paths = " | ".join(str(spec.path) for spec in cfg.client_specs)
-        joined_prior_paths = " | ".join(str(spec.path) for spec in cfg.prior_specs)
-        self.remember_path("recent_client_files", joined_client_paths)
-        self.remember_path("recent_prior_files", joined_prior_paths)
         self.remember_path("recent_output_dirs", str(cfg.out_dir))
         self.data["write_mvp"] = bool(cfg.write_mvp)
         self.data["delete_zero_balance_rows"] = bool(cfg.delete_zero_balance_rows)
@@ -348,11 +351,11 @@ class DropPathCard(QFrame):
     def _suggest_dialog_start(self) -> str:
         text = self.path_text()
         if not text:
-            return str(Path.cwd())
+            return ""
         path = Path(text).expanduser()
         if path.exists():
             return str(path if path.is_dir() else path.parent)
-        return str(path.parent) if path.parent.exists() else str(Path.cwd())
+        return str(path.parent) if path.parent.exists() else ""
 
     def _browse(self) -> None:
         start_dir = self._suggest_dialog_start()
@@ -562,6 +565,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.resize(1380, 920)
+        self.setMinimumSize(1120, 760)
         self.settings_store = SettingsStore()
         self.worker_thread: QThread | None = None
         self.worker: ReconcileWorker | None = None
@@ -625,10 +629,6 @@ class MainWindow(QMainWindow):
         side_layout.setContentsMargins(24, 0, 0, 0)
         side_layout.setSpacing(18)
         workspace.addWidget(side_frame, 1)
-
-        files_title = QLabel("What You Need", content)
-        files_title.setObjectName("SectionTitle")
-        main_column.addWidget(files_title)
 
         self.client_card = DropPathCard(
             "Current-year client TB file(s)",
@@ -789,12 +789,8 @@ class MainWindow(QMainWindow):
         self._append_log("Program ready. Waiting for files.")
 
     def _load_settings(self) -> None:
-        client_recent = self.settings_store.recent("recent_client_files")
-        import_recent = self.settings_store.recent("recent_prior_files")
         out_recent = self.settings_store.recent("recent_output_dirs")
 
-        self.client_card.set_recent_paths(client_recent)
-        self.import_card.set_recent_paths(import_recent)
         self.out_dir_card.set_recent_paths(out_recent)
 
         self.client_card.set_path("")
@@ -1209,15 +1205,9 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl(url))
 
     def _refresh_recent_lists(self) -> None:
-        self.client_card.set_recent_paths(self.settings_store.recent("recent_client_files"))
-        self.import_card.set_recent_paths(self.settings_store.recent("recent_prior_files"))
         self.out_dir_card.set_recent_paths(self.settings_store.recent("recent_output_dirs"))
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        if self.client_card.path_text():
-            self.settings_store.remember_path("recent_client_files", self.client_card.path_text())
-        if self.import_card.path_text():
-            self.settings_store.remember_path("recent_prior_files", self.import_card.path_text())
         if self.out_dir_card.path_text():
             self.settings_store.remember_path("recent_output_dirs", self.out_dir_card.path_text())
         self.settings_store.data["write_mvp"] = self.mvp_checkbox.isChecked()
